@@ -94,8 +94,10 @@ def gen_batch_function(data_folder, image_shape):
 		label_paths = {
 			re.sub(r'_(lane|road)_', '_', os.path.basename(path)): path
 			for path in glob(os.path.join(data_folder, 'gt_image_2', '*_road_*.png'))}
-		background_color = np.array([255, 0, 0])
-
+		background_color = np.array([255, 0, 0])    # the background color is red. The default color scipy space ir RGB.
+		other_road_color = np.array([0,0,0])        # the other lane color is black. 
+		road_color = np.array([0xff, 0x46, 0xf9])   # the color for my road . 
+		
 		# Shuffle training data
 		random.shuffle(image_paths)
 		# Loop through batches and grab images, yielding each batch
@@ -109,10 +111,23 @@ def gen_batch_function(data_folder, image_shape):
 				gt_image = scipy.misc.imresize(scipy.misc.imread(gt_image_file), image_shape)
 
 				# Create "one-hot-like" labels by class
-				gt_bg = np.all(gt_image == background_color, axis=2)
-				gt_bg = gt_bg.reshape(*gt_bg.shape, 1)
-				gt_image = np.concatenate((gt_bg, np.invert(gt_bg)), axis=2)
+                # Background
+				# gt_bg = np.all(gt_image == background_color, axis=2)			
+				# gt_bg = gt_bg.reshape(*gt_bg.shape, 1)
+				
+                # other road
+				gt_or = np.all(gt_image == other_road_color, axis=2)	
+				gt_or = gt_or.reshape(*gt_or.shape,1)
 
+                # my road
+				gt_mr = np.all(gt_image == road_color, axis=2)				
+				gt_mr = gt_mr.reshape(*gt_mr.shape,1)
+				                
+                # first column: Background
+                # second column: Other road
+                # third column: My road, the road where the camera is.
+				# gt_image = np.concatenate((gt_bg, gt_or, gt_mr), axis=2) 						
+				gt_image = np.concatenate((np.invert(gt_or+gt_mr), gt_or, gt_mr), axis=2) 										
 				images.append(image)
 				gt_images.append(gt_image)
 
@@ -135,15 +150,42 @@ def gen_test_output(sess, logits, keep_prob, image_pl, data_folder, image_shape)
 		image = scipy.misc.imresize(scipy.misc.imread(image_file), image_shape)
 
 		# Run inference
-		im_softmax = sess.run([tf.nn.softmax(logits)],{keep_prob: 1.0, image_pl: [image]})		# Splice out second column (road), reshape output back to image_shape
-		im_softmax = im_softmax[0][:, 1].reshape(image_shape[0], image_shape[1])
-		# If road softmax > 0.5, prediction is road
-		segmentation = (im_softmax > 0.5).reshape(image_shape[0], image_shape[1], 1)
+		im_softmax = sess.run(
+			[tf.nn.softmax(logits)],
+			{keep_prob: 1.0, image_pl: [image]})
+
+        # Splice out first (background), reshape output back to image_shape
+		im_background = im_softmax[0][:, 0].reshape(image_shape[0], image_shape[1])
+
+        # Splice out second column (other road), reshape output back to image_shape
+		im_other_lane_softmax = im_softmax[0][:, 1].reshape(image_shape[0], image_shape[1])
+
+		# Splice out third column (my road), reshape output back to image_shape
+		im_my_softmax = im_softmax[0][:, 2].reshape(image_shape[0], image_shape[1])
+
+        # If background softmax > 0.5, prediction is background
+		segmentation_background = (im_background > 0.8).reshape(image_shape[0], image_shape[1], 1)
+
+		# If other road softmax > 0.5, prediction is road
+		segmentation_other = (im_other_lane_softmax > 0.05).reshape(image_shape[0], image_shape[1], 1)
+
+        # If my road softmax > 0.5, prediction is road
+		segmentation_my = (im_my_softmax > 0.05).reshape(image_shape[0], image_shape[1], 1)
+
 		# Create mask based on segmentation to apply to original image
-		mask = np.dot(segmentation, np.array([[0, 255, 0, 127]]))
-		mask = scipy.misc.toimage(mask, mode="RGBA")
+        # create the mask for the background
+		mask_background = np.dot(segmentation_background, np.array([[255, 0, 0, 100]]))    # use red for the background
+		mask_background = scipy.misc.toimage(mask_background, mode="RGBA")		
 		street_im = scipy.misc.toimage(image)
-		street_im.paste(mask, box=None, mask=mask)
+		street_im.paste(mask_background, box=None, mask=mask_background)
+        # create the mask for other road
+		mask_other = np.dot(segmentation_other, np.array([[0, 0, 255, 127]]))    # use blue color for the other road
+		mask_other = scipy.misc.toimage(mask_other, mode="RGBA")		
+		street_im.paste(mask_other, box=None, mask=mask_other)
+        # create the mask for my road
+		mask_my = np.dot(segmentation_my, np.array([[0, 255, 0, 127]]))  # use green color for my road
+		mask_my = scipy.misc.toimage(mask_my, mode="RGBA")
+		street_im.paste(mask_my, box=None, mask=mask_my)
 
 		yield os.path.basename(image_file), np.array(street_im)
 
@@ -159,6 +201,7 @@ def save_inference_samples(runs_dir, data_dir, sess, image_shape, logits, keep_p
 	:param keep_prob: TF Placeholder for the dropout keep probability
 	:param input_image: TF Placeholder for the image placeholder
 	"""
+	print("Start saving images\n")
 	# Make folder for current run
 	output_dir = os.path.join(runs_dir, str(time.time()))
 	if os.path.exists(output_dir):
@@ -171,7 +214,7 @@ def save_inference_samples(runs_dir, data_dir, sess, image_shape, logits, keep_p
 		sess, logits, keep_prob, input_image, os.path.join(data_dir, 'data_road/testing'), image_shape)
 	if create_video:
 		import imageio 
-		writer = imageio.get_writer(str(time.time()) + 'output_video.mp4', fps=4)  
+		writer = imageio.get_writer(str(time.time()) + 'output_video.mp4', fps=10)  
 
 	for name, image in image_outputs:
 		print("Current image: ", os.path.join(output_dir, name), "\n")
